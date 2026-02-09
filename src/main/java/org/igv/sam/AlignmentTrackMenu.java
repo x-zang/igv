@@ -5,6 +5,7 @@ import org.igv.Globals;
 import org.igv.event.AlignmentTrackEvent;
 import org.igv.event.IGVEventBus;
 import org.igv.feature.Range;
+import org.igv.feature.RegionOfInterest;
 import org.igv.feature.Strand;
 import org.igv.jbrowse.CircularViewUtilities;
 import org.igv.logging.LogManager;
@@ -1130,6 +1131,176 @@ class AlignmentTrackMenu extends IGVPopupMenu {
             add(rccItem);
             rccItem.addActionListener(aEvt -> StringUtils.copyTextToClipboard(rcSeq));
         }
+
+        // "Copy read sequence in Region of Interest" items
+        addCopySequenceInROIItems(alignment);
+    }
+
+    /**
+     * Add menu item(s) for copying the read sequence within overlapping Regions of Interest.
+     */
+    private void addCopySequenceInROIItems(Alignment alignment) {
+        if (alignment == null) return;
+
+        Collection<RegionOfInterest> rois = IGV.getInstance().getSession()
+                .getRegionsOfInterest(alignment.getChr());
+        if (rois == null || rois.isEmpty()) return;
+
+        List<RegionOfInterest> overlapping = new ArrayList<>();
+        for (RegionOfInterest roi : rois) {
+            if (roi.getStart() < alignment.getAlignmentEnd() &&
+                    roi.getEnd() > alignment.getAlignmentStart()) {
+                overlapping.add(roi);
+            }
+        }
+
+        if (overlapping.size() == 1) {
+            RegionOfInterest roi = overlapping.get(0);
+            String label = String.format("Copy read sequence in ROI (%s:%,d-%,d)",
+                    roi.getChr(), roi.getStart() + 1, roi.getEnd());
+            JMenuItem roiItem = new JMenuItem(label);
+            roiItem.addActionListener(e -> {
+                String roiSeq = extractReadSequenceInROI(alignment, roi);
+                if (roiSeq != null && !roiSeq.isEmpty()) {
+                    StringUtils.copyTextToClipboard(roiSeq);
+                } else {
+                    MessageUtils.showMessage("No read sequence overlaps this ROI.");
+                }
+            });
+            add(roiItem);
+        } else if (overlapping.size() > 1) {
+            JMenu roiMenu = new JMenu("Copy read sequence in ROI");
+            for (RegionOfInterest roi : overlapping) {
+                String label = String.format("%s:%,d-%,d",
+                        roi.getChr(), roi.getStart() + 1, roi.getEnd());
+                if (roi.getDescription() != null && !roi.getDescription().isEmpty()) {
+                    label += " (" + roi.getDescription() + ")";
+                }
+                JMenuItem subItem = new JMenuItem(label);
+                final RegionOfInterest roiRef = roi;
+                subItem.addActionListener(e -> {
+                    String roiSeq = extractReadSequenceInROI(alignment, roiRef);
+                    if (roiSeq != null && !roiSeq.isEmpty()) {
+                        StringUtils.copyTextToClipboard(roiSeq);
+                    } else {
+                        MessageUtils.showMessage("No read sequence overlaps this ROI.");
+                    }
+                });
+                roiMenu.add(subItem);
+            }
+            add(roiMenu);
+        }
+    }
+
+    /**
+     * Extract the portion of a read's sequence that falls within a Region of Interest,
+     * by walking the CIGAR to convert reference coordinates to read coordinates,
+     * then taking a single substring of the read sequence.
+     *
+     * @param alignment The read alignment
+     * @param roi       The region of interest (0-based, half-open)
+     * @return The subsequence of the read within the ROI, or null
+     */
+    private static String extractReadSequenceInROI(Alignment alignment, RegionOfInterest roi) {
+        String fullSeq = alignment.getReadSequence();
+        if (fullSeq == null || fullSeq.equals("*")) return null;
+
+        int roiStart = roi.getStart();
+        int roiEnd = roi.getEnd();
+
+        htsjdk.samtools.Cigar cigar = alignment.getCigar();
+        if (cigar == null || cigar.isEmpty()) return null;
+
+        int[] readCoords = refSpanToReadCoords(cigar, alignment.getAlignmentStart(), roiStart, roiEnd);
+        if (readCoords == null) return null;
+
+        int readStart = readCoords[0];
+        int readEnd = readCoords[1];
+        if (readStart >= readEnd || readStart < 0 || readEnd > fullSeq.length()) return null;
+
+        return fullSeq.substring(readStart, readEnd);
+    }
+
+    /**
+     * Convert reference span coordinates to read coordinates by walking the CIGAR.
+     * Mirrors the logic of ref_span_to_read_coords_generic from loca/src/hit.rs.
+     *
+     * @param cigar          htsjdk Cigar object
+     * @param alignmentStart 0-based reference start of the alignment
+     * @param spanStart      0-based reference start of the target span
+     * @param spanEnd        0-based reference end of the target span (exclusive)
+     * @return int[]{readStart, readEnd} or null if span has no corresponding read sequence
+     */
+    private static int[] refSpanToReadCoords(htsjdk.samtools.Cigar cigar, int alignmentStart,
+                                              int spanStart, int spanEnd) {
+        int readPos = 0;
+        int refPos = alignmentStart;
+        Integer readStart = null;
+        Integer readEnd = null;
+
+        if (spanStart < alignmentStart) {
+            readStart = 0;
+        }
+
+        for (htsjdk.samtools.CigarElement element : cigar.getCigarElements()) {
+            htsjdk.samtools.CigarOperator op = element.getOperator();
+            int opLen = element.getLength();
+            boolean consumesRef = op.consumesReferenceBases();
+            boolean consumesRead = op.consumesReadBases();
+
+            if (consumesRef && consumesRead) {
+                // M, =, X: both ref and read advance
+                int refEndPos = refPos + opLen;
+
+                if (readStart == null && spanStart >= refPos && spanStart < refEndPos) {
+                    int offset = spanStart - refPos;
+                    readStart = readPos + offset;
+                }
+
+                if (readStart != null && spanEnd >= refPos && spanEnd <= refEndPos) {
+                    int offset = spanEnd - refPos;
+                    readEnd = readPos + offset;
+                    break;
+                }
+
+                readPos += opLen;
+                refPos = refEndPos;
+            } else if (consumesRef) {
+                // D, N: only ref advances
+                int refEndPos = refPos + opLen;
+
+                // If span is entirely within a skip (N), no corresponding read sequence
+                if (op == htsjdk.samtools.CigarOperator.N &&
+                        spanStart >= refPos && spanEnd <= refEndPos) {
+                    return null;
+                }
+
+                if (readStart == null && spanStart >= refPos && spanStart < refEndPos) {
+                    readStart = readPos;
+                }
+
+                if (readStart != null && spanEnd > refPos && spanEnd <= refEndPos) {
+                    readEnd = readPos;
+                    break;
+                }
+
+                refPos = refEndPos;
+            } else if (consumesRead) {
+                // I, S: only read advances
+                readPos += opLen;
+            }
+            // H, P: neither advances
+        }
+
+        // If span extends beyond the alignment end
+        if (readStart != null && readEnd == null) {
+            readEnd = readPos;
+        }
+
+        if (readStart != null && readEnd != null) {
+            return new int[]{readStart, readEnd};
+        }
+        return null;
     }
 
 
